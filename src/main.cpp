@@ -39,13 +39,18 @@ SoftwareSerial soft_serial(8, 9); // DYNAMIXELShield UART RX/TX
 
 #define MQTT_HOST IPAddress(172, 23, 193, 33)
 #define MQTT_PORT 1883
-#define MQTT_TOPIC_STATE "Marionette/State/State"
-#define MQTT_TOPIC_SEQUENCE "Marionette/State/SequenceStep"
-#define MQTT_TOPIC_MOVEMENT "Marionette/State/movement"
-#define MQTT_TOPIC_ERRORS "Marionette/Errors"
-#define MQTT_TOPIC_MAINTENANCE_REBOOT_MOTOR "Marionette/Maintenance/reboot_motor"
-#define MQTT_TOPIC_MAINTENANCE_RESTART "Marionette/Maintenance/restart"
-#define MQTT_TOPIC_MAINTENANCE_GET_POS "Marionette/Maintenance/get_pos"
+
+// Subscribers
+#define MQTT_TOPIC_REBOOT_MOTOR_SUB "Home/Marionette/Command/RebootMotor"
+#define MQTT_TOPIC_RESTART_SUB "Home/Marionette/Command/RestartESP"
+#define MQTT_TOPIC_GET_POS_SUB "Home/Marionette/Command/GetPositionMotors"
+#define MQTT_TOPIC_SEQUENCE_SUB "Home/Marionette/Command/Sequence" // TODO
+
+// Publishers
+#define MQTT_TOPIC_SEQUENCE_PUB "Home/Marionette/Informations/Sequence"
+#define MQTT_TOPIC_MOVEMENT_PUB "Home/Marionette/Informations/Movement"
+#define MQTT_TOPIC_ERRORS_PUB "Home/Marionette/Informations/ErrorMotor"
+#define MQTT_TOPIC_GET_POS_PUB "Home/Marionette/Informations/Position/Motor" //+ "X" X étant l'ID du moteur
 
 AsyncMqttClient mqttClient;
 TimerHandle_t mqttReconnectTimer;
@@ -58,8 +63,9 @@ BluetoothSerial SerialBT;
  * STEPPER VARIABLES
  */
 
-#define dirPin 23
-#define stepPin 22
+#define dirPin 22
+#define stepPin 23
+#define enPin 14
 #define motorInterfaceType 1
 AccelStepper stepper = AccelStepper(motorInterfaceType, stepPin, dirPin);
 
@@ -84,6 +90,7 @@ AccelStepper stepper = AccelStepper(motorInterfaceType, stepPin, dirPin);
 ** ID 14 Aile droite (avance/recule)
 ** ID 15 Tête rotation
 */
+
 const uint8_t BROADCAST_ID = 254;
 const float DYNAMIXEL_PROTOCOL_VERSION = 2.0;
 const uint8_t DXL_ID_CNT = 15;
@@ -127,13 +134,19 @@ long previous_timer = 0;
 // single motor
 int goal_position = 0;
 int present_position = 0;
+int tab_error[DXL_ID_CNT] = {100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100};
+bool tab_validation_goal[DXL_ID_CNT] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+int test_validation = 0;
+int goal_reached = 0;
+int number_try = 1;
 
+int error = 1000;
 // Multi_motor
 int goal_position_sequence1[DXL_ID_CNT] = {50, 50, 14000, 14000, 14000, 14000, 14000, 10000, 14000, 14000, 14000, 14000, 50, 50, 50};
 int goal_position_sequence2[DXL_ID_CNT] = {50, 50, 8000, 8000, 8000, 8000, 8000, 8000, 8000, 8000, 8000, 8000, 50, 50, 50};
 int goal_position_sequence3[DXL_ID_CNT] = {50, 50, 8000, 8000, 8000, 8000, 8000, 4000, 8000, 8000, 8000, 8000, 50, 50, 50};
 int goal_position_sequence_repos[DXL_ID_CNT] = {50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50};
-int goal_position_sequence_test[DXL_ID_CNT] = {50, 50, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 50, 50, 50};
+int goal_position_sequence_test[DXL_ID_CNT] = {500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500};
 
 int goal_position_sequence_coucou1[DXL_ID_CNT] = {50, 50, 50, -1024, 1024, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50};
 int goal_position_sequence_coucou2[DXL_ID_CNT] = {50, 50, 50, -2048, 1024, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50};
@@ -148,8 +161,8 @@ int goal_position_tete_tourne_droite[DXL_ID_CNT] = {50, 50, -5000, -7700, -6500,
 
 int goal_position_tab[DXL_ID_CNT];
 int present_position_tab[DXL_ID_CNT];
-int movement = 0;
-int sequence = 0;
+int movement = 0; // 1 mouvement et composé d'un seul objectif par moteur
+int sequence = 0; // 1 séquence est une continuité de mouvements
 
 int idx[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
 int goal_pos_dynamixel[DXL_ID_CNT] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
@@ -171,31 +184,31 @@ void check_hardware_issue()
       Serial.print("Voltage Input error (Overvoltage) for dynamixel : ");
       Serial.println(i + 1);
       error = 1;
-      mqttClient.publish((MQTT_TOPIC_ERRORS), 1, false, "1");
+      mqttClient.publish((MQTT_TOPIC_ERRORS_PUB), 1, false, "1");
       break;
     case 4:
       Serial.print("Overheating error for dynamixel : ");
       Serial.println(i + 1);
       error = 1;
-      mqttClient.publish((MQTT_TOPIC_ERRORS), 1, false, "4");
+      mqttClient.publish((MQTT_TOPIC_ERRORS_PUB), 1, false, "4");
       break;
     case 8:
       Serial.print("motor encodeur error for dynamixel : ");
       Serial.println(i + 1);
       error = 1;
-      mqttClient.publish((MQTT_TOPIC_ERRORS), 1, false, "8");
+      mqttClient.publish((MQTT_TOPIC_ERRORS_PUB), 1, false, "8");
       break;
     case 16:
       Serial.print("Electrical shock error for dynamixel : ");
       Serial.println(i + 1);
       error = 1;
-      mqttClient.publish((MQTT_TOPIC_ERRORS), 1, false, "16");
+      mqttClient.publish((MQTT_TOPIC_ERRORS_PUB), 1, false, "16");
       break;
     case 32:
       Serial.print("Overload for dynamixel : ");
       Serial.println(i + 1);
       error = 1;
-      mqttClient.publish((MQTT_TOPIC_ERRORS), 1, false, "32");
+      mqttClient.publish((MQTT_TOPIC_ERRORS_PUB), 1, false, "32");
       break;
     default:
       break;
@@ -212,7 +225,7 @@ bool is_goals_reached()
   bool goal_reached = 1;
   for (int i = 0; i < DXL_ID_CNT; i++)
   {
-    if (abs(goal_position_tab[i] - present_position_tab[i]) > 50)
+    if (abs(goal_position_tab[i] - present_position_tab[i]) > 10)
     {
       Serial.print("not reached for dynamixel ");
       Serial.println(i + 1);
@@ -276,9 +289,10 @@ void WiFiEvent(WiFiEvent_t event)
 void onMqttConnect(bool sessionPresent)
 {
   Serial.println("Connected to MQTT.");
-  mqttClient.subscribe(MQTT_TOPIC_MAINTENANCE_REBOOT_MOTOR, 2);
-  mqttClient.subscribe(MQTT_TOPIC_MAINTENANCE_RESTART, 2);
-  mqttClient.subscribe(MQTT_TOPIC_MAINTENANCE_GET_POS, 2);
+  mqttClient.subscribe(MQTT_TOPIC_REBOOT_MOTOR_SUB, 2);
+  mqttClient.subscribe(MQTT_TOPIC_RESTART_SUB, 2);
+  mqttClient.subscribe(MQTT_TOPIC_GET_POS_SUB, 2);
+  mqttClient.subscribe(MQTT_TOPIC_SEQUENCE_SUB, 2);
 }
 
 void onMqttDisconnect(AsyncMqttClientDisconnectReason reason)
@@ -321,22 +335,23 @@ void onMqttMessage(char *topic, char *payload, AsyncMqttClientMessageProperties 
   Serial.print("  : ");
   Serial.println(messageTemp);
 
-  if (String(topic) == MQTT_TOPIC_MAINTENANCE_REBOOT_MOTOR)
+  if (String(topic) == MQTT_TOPIC_REBOOT_MOTOR_SUB)
   {
     Serial.println("Reboot motor : ");
     Serial.println(messageTemp.toInt());
     reboot_dynamixel(messageTemp.toInt());
   }
-  if (String(topic) == MQTT_TOPIC_MAINTENANCE_RESTART && messageTemp == "1")
+  if (String(topic) == MQTT_TOPIC_RESTART_SUB && messageTemp == "1")
   {
     Serial.println("Restart");
     ESP.restart();
   }
-  if (String(topic) == MQTT_TOPIC_MAINTENANCE_GET_POS && messageTemp == "1")
+  if (String(topic) == MQTT_TOPIC_GET_POS_SUB && messageTemp == "1")
   {
     Serial.println("Get motors position");
-    for(int i = 0; i < DXL_ID_CNT; i++){
-      String temp = "Marionette/Maintenance/get_pos/" + String(i);
+    for (int i = 0; i < DXL_ID_CNT; i++)
+    {
+      String temp = MQTT_TOPIC_GET_POS_PUB + String(i);
       mqttClient.publish((temp).c_str(), 1, false, String(present_position_tab[i]).c_str());
     }
   }
@@ -440,8 +455,9 @@ void go_to_positions_multiple_motors(int *tab)
 {
   movement++;
   uint8_t i, recv_cnt;
-  mqttClient.publish((MQTT_TOPIC_SEQUENCE), 1, false, String(sequence).c_str());
-  mqttClient.publish((MQTT_TOPIC_MOVEMENT), 1, false, String(movement).c_str());
+  error = 0;
+  mqttClient.publish((MQTT_TOPIC_SEQUENCE_PUB), 1, false, String(sequence).c_str());
+  mqttClient.publish((MQTT_TOPIC_MOVEMENT_PUB), 1, false, String(movement).c_str());
   // Insert a new Goal Position to the SyncWrite Packet
   for (int i = 0; i < DXL_ID_CNT; i++)
   {
@@ -480,45 +496,133 @@ void go_to_positions_multiple_motors(int *tab)
 
   while (dxl.readControlTableItem(MOVING, DXL_ID_LIST[0]) || dxl.readControlTableItem(MOVING, DXL_ID_LIST[1]) || dxl.readControlTableItem(MOVING, DXL_ID_LIST[2]) || dxl.readControlTableItem(MOVING, DXL_ID_LIST[3]) || dxl.readControlTableItem(MOVING, DXL_ID_LIST[4]) || dxl.readControlTableItem(MOVING, DXL_ID_LIST[5]) || dxl.readControlTableItem(MOVING, DXL_ID_LIST[6]) || dxl.readControlTableItem(MOVING, DXL_ID_LIST[7]) || dxl.readControlTableItem(MOVING, DXL_ID_LIST[8]) || dxl.readControlTableItem(MOVING, DXL_ID_LIST[9]) || dxl.readControlTableItem(MOVING, DXL_ID_LIST[10]) || dxl.readControlTableItem(MOVING, DXL_ID_LIST[11]) || dxl.readControlTableItem(MOVING, DXL_ID_LIST[12]) || dxl.readControlTableItem(MOVING, DXL_ID_LIST[13]) || dxl.readControlTableItem(MOVING, DXL_ID_LIST[14]) || millis() - previous_timer < 200)
   {
+    error = 0;
     recv_cnt = dxl.syncRead(&sr_infos);
     compteur_sync_read++;
-    /*
+
     if (recv_cnt > 0)
     {
-      for (i = 0; i < 2; i++)
+      for (i = 0; i < DXL_ID_CNT; i++)
       {
-        present_position_tab[i] = sr_data[i].present_position;
-        DEBUG_SERIAL.print("  ID: ");
-        DEBUG_SERIAL.print(sr_infos.p_xels[i].id);
-        DEBUG_SERIAL.print(" Present Position: ");
-        DEBUG_SERIAL.print(sr_data[i].present_position);
-        DEBUG_SERIAL.print(" Goal Position: ");
-        DEBUG_SERIAL.println(goal_position_tab[i]);
+        tab_error[i] = sqrt(pow(sw_data[i].goal_position - sr_data[i].present_position, 2));
+        error = tab_error[i] + error;
       }
     }
-    */
+    // Serial.println(error);
   }
 
-  DEBUG_SERIAL.print(" Goal achieved timer: ");
+  /* fin du mouvement display des valeurs d'erreurs, de position et d'id */
+  DEBUG_SERIAL.print("Goal achieved timer: ");
   DEBUG_SERIAL.println(millis() - previous_timer);
-  Serial.println(compteur_sync_read);
+  // Serial.println(compteur_sync_read);
 
+  Serial.print("error cumulated = ");
+  Serial.println(error);
+
+  goal_reached = 1;
   for (i = 0; i < sw_infos.xel_count; i++)
   {
-    DEBUG_SERIAL.print("  ID: ");
+    DEBUG_SERIAL.print("ID: ");
     DEBUG_SERIAL.print(sw_infos.p_xels[i].id);
     DEBUG_SERIAL.print(" final Position: ");
     DEBUG_SERIAL.print(sr_data[i].present_position);
     present_position_tab[i] = sr_data[i].present_position;
     DEBUG_SERIAL.print(" error Position: ");
     DEBUG_SERIAL.println(abs(sr_data[i].present_position - sw_data[i].goal_position));
+
+    /* verification de l'erreur */
+    if (abs(sr_data[i].present_position - sw_data[i].goal_position) > 15)
+    {
+      Serial.print("not reached for dynamixel ");
+      Serial.println(i + 1);
+      Serial.print("error : ");
+      Serial.println(abs(sr_data[i].present_position - sw_data[i].goal_position));
+      goal_reached = 0;
+    }
   }
-  if (!is_goals_reached())
+
+  /* Si l'objectif n'est pas atteint alors debug */
+  if (goal_reached == 0 && number_try < 3)
   {
+    number_try++;
+    go_to_positions_multiple_motors(tab);
     delay(5000);
     check_hardware_issue();
   }
+  else
+  {
+    Serial.print("goal reached in ");
+    Serial.print(number_try);
+    Serial.println(" try");
+    number_try = 1;
+  }
+
   DEBUG_SERIAL.println("=======================================================");
+  Serial.println();
+  }
+
+void go_to_positions_multiple_motors_BO(int *tab)
+{
+  uint8_t i, recv_cnt;
+  int error = 1000;
+  goal_reached = 0;
+
+  for (int i = 0; i < DXL_ID_CNT; i++)
+  {
+    sw_data[i].goal_position = tab[i];
+  }
+  sw_infos.is_info_changed = true;
+
+  DEBUG_SERIAL.print("\n>>>>>> Sync Instruction Test : ");
+
+  // Build a SyncWrite Packet and transmit to DYNAMIXEL
+  if (dxl.syncWrite(&sw_infos) == true)
+  {
+    DEBUG_SERIAL.println("[SyncWrite] Success");
+    for (i = 0; i < sw_infos.xel_count; i++)
+    {
+      DEBUG_SERIAL.print("  ID: ");
+      DEBUG_SERIAL.print(sw_infos.p_xels[i].id);
+      DEBUG_SERIAL.print(" Goal Position: ");
+      DEBUG_SERIAL.println(sw_data[i].goal_position);
+    }
+  }
+  else
+  {
+    DEBUG_SERIAL.print("[SyncWrite] Fail, Lib error code: ");
+    DEBUG_SERIAL.print(dxl.getLastLibErrCode());
+  }
+  DEBUG_SERIAL.println();
+
+  previous_timer = millis();
+
+  while (error > 50)
+  // while(goal_reached != 15)
+  {
+    error = 0;
+    recv_cnt = dxl.syncRead(&sr_infos);
+    if (recv_cnt > 0)
+    {
+      for (i = 0; i < recv_cnt; i++)
+      {
+        tab_error[i] = sqrt(pow(sw_data[i].goal_position - sr_data[i].present_position, 2));
+      }
+    }
+
+    for (int i = 0; i < sw_infos.xel_count; i++)
+    {
+      error = tab_error[i] + error;
+    }
+    Serial.println(error);
+  }
+  for (int i = 0; i < sw_infos.xel_count; i++)
+  {
+    Serial.print(tab_error[i]);
+    Serial.print(" ");
+  }
+  Serial.print(" Goal achieved timer: ");
+  Serial.println(millis() - previous_timer);
+  Serial.println();
 }
 
 void go_to_position(int position, int ID_moteur)
@@ -636,6 +740,7 @@ void init_dynamixel()
   for (int i = 0; i < DXL_ID_CNT; i++)
   {
     set_velocity_accel(50, 100, i);
+    dxl.writeControlTableItem(MOVING_THRESHOLD, DXL_ID_LIST[i], 0);
   }
 }
 
@@ -675,38 +780,51 @@ void setup()
 
   pinMode(LED_BUILTIN, OUTPUT);
   DEBUG_SERIAL.begin(115200);
-  pinMode(22, OUTPUT);
-  pinMode(23, OUTPUT);
+  pinMode(dirPin, OUTPUT);
+  pinMode(stepPin, OUTPUT);
+  pinMode(enPin, OUTPUT);
+  digitalWrite(enPin, LOW);
 
   /*
   ** INIT ALL
   */
-  init_mqtt();
+  /*
+   init_mqtt();
 
-  initOTA();
+   initOTA();
+   */
 
   stepper.setMaxSpeed(1000);
   stepper.setAcceleration(200);
-  SerialBT.begin("ESP32marionette"); // Bluetooth device name
+  Serial.println(SerialBT.begin("ESP32_marionette")); // Bluetooth device name
 
   init_dynamixel();
 
   /*
   ** Test multiple motors
   */
+
   sequence = 1;
   go_to_positions_multiple_motors(goal_position_sequence_repos); // debout
+  delay(1000);
   go_to_positions_multiple_motors(goal_position_sequence_test); // debout
+  delay(1000);
+  go_to_positions_multiple_motors(goal_position_sequence_repos); // debout
+  delay(1000);
+
+  go_to_positions_multiple_motors(goal_position_tete_tourne_droite); // debout
+  delay(1000);
   go_to_positions_multiple_motors(goal_position_sequence_repos); // debout
 
-  /* Test single motor
-  go_to_position(50,3);
-  delay(1000);
-  go_to_position(500,3);
-  delay(1000);
-  go_to_position(50,3);
-  delay(1000);
-  */
+  /*
+    //Test single motor
+    go_to_position(0,7);
+    delay(1000);
+    go_to_position(500,7);
+    delay(1000);
+    go_to_position(0,7);
+    delay(1000);
+    */
 
   /*
   ** TEST PROFILE VEL & ACC
@@ -725,7 +843,7 @@ void setup()
 
 void loop()
 {
-  ArduinoOTA.handle();
+  // ArduinoOTA.handle();
   if (SerialBT.available())
   {
     String consigne2 = SerialBT.readString();
@@ -735,7 +853,7 @@ void loop()
     {
       goal_pos_dynamixel[i] = parse_tab[i];
     }
-    go_to_positions_multiple_motors(goal_pos_dynamixel);
+    go_to_positions_multiple_motors_BO(goal_pos_dynamixel);
 
     stepper.moveTo(parse_tab[15]);
     stepper.runToPosition();
